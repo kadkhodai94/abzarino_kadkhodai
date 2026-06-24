@@ -1,0 +1,130 @@
+name: Build Latest Flutter ZIP APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find latest ZIP
+        id: find_zip
+        run: |
+          set -e
+          ZIP_FILE=$(ls -t *.zip 2>/dev/null | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found in repository root."
+            exit 1
+          fi
+
+          echo "Latest ZIP: $ZIP_FILE"
+          echo "zip_file=$ZIP_FILE" >> $GITHUB_OUTPUT
+
+      - name: Extract latest ZIP
+        run: |
+          set -e
+          mkdir extracted
+          unzip -q "${{ steps.find_zip.outputs.zip_file }}" -d extracted
+
+          echo "Extracted files:"
+          find extracted -maxdepth 3 -type f | head -100
+
+      - name: Locate Flutter project
+        id: locate_project
+        run: |
+          set -e
+
+          PROJECT_DIR=$(find extracted -name pubspec.yaml -type f | head -n 1 | xargs dirname)
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: No Flutter project found. pubspec.yaml missing."
+            exit 1
+          fi
+
+          echo "Flutter project: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Prepare Android project if missing
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: |
+          set -e
+
+          if [ ! -d "android" ]; then
+            echo "Android folder not found. Creating Flutter Android project..."
+            flutter create --platforms=android .
+          fi
+
+      - name: Get dependencies
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: flutter pub get
+
+      - name: Analyze project
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: flutter analyze || true
+
+      - name: Build release APK
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: |
+          set -e
+          flutter build apk --release --no-shrink
+
+      - name: Build release AAB
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: |
+          set -e
+          flutter build appbundle --release --no-shrink || true
+
+      - name: Rename outputs
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: |
+          set -e
+          mkdir -p final_outputs
+
+          if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
+            cp build/app/outputs/flutter-apk/app-release.apk final_outputs/abzarino-release.apk
+          fi
+
+          if [ -f build/app/outputs/bundle/release/app-release.aab ]; then
+            cp build/app/outputs/bundle/release/app-release.aab final_outputs/abzarino-release.aab
+          fi
+
+          ls -lah final_outputs
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: abzarino-apk
+          path: ${{ steps.locate_project.outputs.project_dir }}/final_outputs/*.apk
+          if-no-files-found: error
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: abzarino-aab
+          path: ${{ steps.locate_project.outputs.project_dir }}/final_outputs/*.aab
+          if-no-files-found: ignore
