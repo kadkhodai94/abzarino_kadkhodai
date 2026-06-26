@@ -78,97 +78,188 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -d android ]; then
-            flutter create --platforms=android --org ir.gamino.abzarino .
+          if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
+            flutter create --platforms=android --org mk.kadkhodai .
           fi
 
-      - name: Force stable Android SDK 34
+      - name: Prepare signed Android package
         working-directory: ${{ steps.locate_project.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import re
+          import re, shutil
+
+          PACKAGE = 'mk.kadkhodai.abzar'
+          VERSION_NAME = '1.3.7'
+          VERSION_CODE = '11'
+
+          pubspec = Path('pubspec.yaml')
+          pub = pubspec.read_text(encoding='utf-8')
+          pub = re.sub(r'^version:\s*.*$', f'version: {VERSION_NAME}+{VERSION_CODE}', pub, flags=re.M)
+          if 'flutter_plugin_android_lifecycle:' not in pub:
+              if 'dependency_overrides:' not in pub:
+                  pub = pub.rstrip() + '\n\ndependency_overrides:\n  flutter_plugin_android_lifecycle: 2.0.24\n'
+              else:
+                  pub = pub.rstrip() + '\n  flutter_plugin_android_lifecycle: 2.0.24\n'
+          pubspec.write_text(pub, encoding='utf-8')
+
+          ks_dir = Path('release_keystore')
+          src_jks = ks_dir / 'bazikhone_release_key.jks'
+          src_props = ks_dir / 'key.properties'
+          if not src_jks.exists() or not src_props.exists():
+              raise SystemExit('Keystore files are missing. Expected release_keystore/bazikhone_release_key.jks and key.properties')
+
+          props = {}
+          for line in src_props.read_text(encoding='utf-8').splitlines():
+              if '=' in line and not line.strip().startswith('#'):
+                  k, v = line.split('=', 1)
+                  props[k.strip()] = v.strip()
+          for required in ['storePassword', 'keyPassword', 'keyAlias']:
+              if not props.get(required):
+                  raise SystemExit(f'Missing {required} in release_keystore/key.properties')
+
+          dest_dir = Path('android/app/keystore')
+          dest_dir.mkdir(parents=True, exist_ok=True)
+          dest_jks = dest_dir / 'bazikhone_release_key.jks'
+          shutil.copy2(src_jks, dest_jks)
+
+          Path('android/key.properties').write_text(
+              'storePassword=' + props['storePassword'] + '\n' +
+              'keyPassword=' + props['keyPassword'] + '\n' +
+              'keyAlias=' + props['keyAlias'] + '\n' +
+              'storeFile=app/keystore/bazikhone_release_key.jks\n',
+              encoding='utf-8'
+          )
+
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          if manifest.exists():
+              m = manifest.read_text(encoding='utf-8')
+              if 'android.permission.USE_BIOMETRIC' not in m:
+                  m = m.replace('<application', '<uses-permission android:name="android.permission.USE_BIOMETRIC"/>\n    <application', 1)
+              if 'android:label=' in m:
+                  m = re.sub(r'android:label="[^"]*"', 'android:label="ابزارینو"', m, count=1)
+              else:
+                  m = m.replace('<application', '<application android:label="ابزارینو"', 1)
+              manifest.write_text(m, encoding='utf-8')
+
+          target_kotlin_dir = Path('android/app/src/main/kotlin') / Path(PACKAGE.replace('.', '/'))
+          target_java_dir = Path('android/app/src/main/java') / Path(PACKAGE.replace('.', '/'))
+
+          for root in [Path('android/app/src/main/kotlin'), Path('android/app/src/main/java')]:
+              if root.exists():
+                  for f in list(root.rglob('MainActivity.*')):
+                      text = f.read_text(encoding='utf-8')
+                      if f.suffix == '.kt':
+                          text = text.replace('import io.flutter.embedding.android.FlutterActivity', 'import io.flutter.embedding.android.FlutterFragmentActivity')
+                          text = text.replace('FlutterActivity()', 'FlutterFragmentActivity()')
+                          if re.search(r'^package\s+', text, flags=re.M):
+                              text = re.sub(r'^package\s+[^\n]+', f'package {PACKAGE}', text, flags=re.M)
+                          else:
+                              text = f'package {PACKAGE}\n\n' + text
+                          target_kotlin_dir.mkdir(parents=True, exist_ok=True)
+                          target = target_kotlin_dir / f.name
+                      else:
+                          text = text.replace('import io.flutter.embedding.android.FlutterActivity;', 'import io.flutter.embedding.android.FlutterFragmentActivity;')
+                          text = text.replace('extends FlutterActivity', 'extends FlutterFragmentActivity')
+                          if re.search(r'^package\s+', text, flags=re.M):
+                              text = re.sub(r'^package\s+[^;]+;', f'package {PACKAGE};', text, flags=re.M)
+                          else:
+                              text = f'package {PACKAGE};\n\n' + text
+                          target_java_dir.mkdir(parents=True, exist_ok=True)
+                          target = target_java_dir / f.name
+                      target.write_text(text, encoding='utf-8')
+                      if f.resolve() != target.resolve():
+                          f.unlink()
 
           candidates = [Path('android/app/build.gradle'), Path('android/app/build.gradle.kts')]
           app_gradle = next((p for p in candidates if p.exists()), None)
           if app_gradle is None:
               raise SystemExit('android/app/build.gradle or build.gradle.kts not found after flutter create')
 
-          s = app_gradle.read_text(encoding='utf-8')
+          g = app_gradle.read_text(encoding='utf-8')
+
           if app_gradle.suffix == '.kts':
-              s = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 34', s)
-              s = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 34', s)
-              if 'compileSdk' not in s:
-                  s = s.replace('android {', 'android {\n    compileSdk = 34', 1)
+              if 'import java.util.Properties' not in g:
+                  g = 'import java.util.Properties\nimport java.io.FileInputStream\n\n' + g
+
+              if 'val keystoreProperties = Properties()' not in g:
+                  idx = g.find('plugins {')
+                  end_plugins = g.find('\n}\n', idx) if idx >= 0 else -1
+                  if end_plugins >= 0:
+                      insert_at = end_plugins + 3
+                      block = '''\nval keystoreProperties = Properties()\nval keystorePropertiesFile = rootProject.file("key.properties")\nif (keystorePropertiesFile.exists()) {\n    keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n}\n'''
+                      g = g[:insert_at] + block + g[insert_at:]
+
+              g = re.sub(r'namespace\s*=\s*"[^"]+"', f'namespace = "{PACKAGE}"', g)
+              if 'namespace =' not in g:
+                  g = g.replace('android {', f'android {{\n    namespace = "{PACKAGE}"', 1)
+
+              g = re.sub(r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{PACKAGE}"', g)
+              g = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 34', g)
+              g = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 34', g)
+              if 'compileSdk' not in g:
+                  g = g.replace('android {', 'android {\n    compileSdk = 34', 1)
+
+              if 'signingConfigs {' not in g:
+                  signing = '''\n    signingConfigs {\n        create("release") {\n            keyAlias = keystoreProperties["keyAlias"] as String\n            keyPassword = keystoreProperties["keyPassword"] as String\n            storeFile = file(keystoreProperties["storeFile"] as String)\n            storePassword = keystoreProperties["storePassword"] as String\n        }\n    }\n'''
+                  g = g.replace('    buildTypes {', signing + '\n    buildTypes {', 1)
+
+              g = re.sub(
+                  r'signingConfig\s*=\s*signingConfigs\.getByName\("debug"\)',
+                  'signingConfig = signingConfigs.getByName("release")',
+                  g
+              )
+              if 'signingConfig = signingConfigs.getByName("release")' not in g:
+                  g = re.sub(
+                      r'release\s*\{',
+                      'release {\n            signingConfig = signingConfigs.getByName("release")',
+                      g,
+                      count=1
+                  )
+
           else:
-              s = re.sub(r'compileSdk\s*=\s*[^\n]+', 'compileSdk = 34', s)
-              s = re.sub(r'compileSdkVersion\s+[^\n]+', 'compileSdkVersion 34', s)
-              s = re.sub(r'targetSdk\s*=\s*[^\n]+', 'targetSdk = 34', s)
-              s = re.sub(r'targetSdkVersion\s+[^\n]+', 'targetSdkVersion 34', s)
-              if 'compileSdk' not in s and 'compileSdkVersion' not in s:
-                  s = s.replace('android {', 'android {\n    compileSdk = 34', 1)
+              if 'def keystoreProperties = new Properties()' not in g:
+                  g = """def keystoreProperties = new Properties()
+          def keystorePropertiesFile = rootProject.file('key.properties')
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+          }
 
-          app_gradle.write_text(s, encoding='utf-8')
-          print(app_gradle)
-          print(app_gradle.read_text(encoding='utf-8')[:1600])
-          PY
+          """ + g
 
-      - name: Force compatible Flutter Android lifecycle dependency
-        working-directory: ${{ steps.locate_project.outputs.project_dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('pubspec.yaml')
-          s = p.read_text(encoding='utf-8')
-          if 'flutter_plugin_android_lifecycle:' not in s:
-              s = s.rstrip() + '\n\ndependency_overrides:\n  flutter_plugin_android_lifecycle: 2.0.24\n'
-          elif 'dependency_overrides:' not in s:
-              s = s.rstrip() + '\n\ndependency_overrides:\n  flutter_plugin_android_lifecycle: 2.0.24\n'
-          p.write_text(s, encoding='utf-8')
-          print(p.read_text(encoding='utf-8'))
-          PY
+              g = re.sub(r'namespace\s+[\'"][^\'"]+[\'"]', f'namespace "{PACKAGE}"', g)
+              g = re.sub(r'namespace\s*=\s*[\'"][^\'"]+[\'"]', f'namespace = "{PACKAGE}"', g)
+              if 'namespace' not in g:
+                  g = g.replace('android {', f'android {{\n    namespace "{PACKAGE}"', 1)
 
-      - name: Force Android app label and biometric permission
-        working-directory: ${{ steps.locate_project.outputs.project_dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          manifest = Path('android/app/src/main/AndroidManifest.xml')
-          if manifest.exists():
-              s = manifest.read_text(encoding='utf-8')
-              if 'android.permission.USE_BIOMETRIC' not in s:
-                  s = s.replace('<application', '<uses-permission android:name="android.permission.USE_BIOMETRIC"/>\n    <application', 1)
-              if 'android:label=' in s:
-                  s = re.sub(r'android:label="[^"]*"', 'android:label="ابزارینو"', s, count=1)
-              else:
-                  s = s.replace('<application', '<application android:label="ابزارینو"', 1)
-              manifest.write_text(s, encoding='utf-8')
-          PY
+              g = re.sub(r'applicationId\s+[\'"][^\'"]+[\'"]', f'applicationId "{PACKAGE}"', g)
+              g = re.sub(r'applicationId\s*=\s*[\'"][^\'"]+[\'"]', f'applicationId = "{PACKAGE}"', g)
 
-      - name: Patch Android for biometric authentication
-        working-directory: ${{ steps.locate_project.outputs.project_dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          for kt in Path('android/app/src/main/kotlin').rglob('MainActivity.kt'):
-              text = kt.read_text(encoding='utf-8')
-              text = text.replace('import io.flutter.embedding.android.FlutterActivity', 'import io.flutter.embedding.android.FlutterFragmentActivity')
-              text = text.replace('FlutterActivity()', 'FlutterFragmentActivity()')
-              kt.write_text(text, encoding='utf-8')
-          for java in Path('android/app/src/main/java').rglob('MainActivity.java'):
-              text = java.read_text(encoding='utf-8')
-              text = text.replace('import io.flutter.embedding.android.FlutterActivity;', 'import io.flutter.embedding.android.FlutterFragmentActivity;')
-              text = text.replace('extends FlutterActivity', 'extends FlutterFragmentActivity')
-              java.write_text(text, encoding='utf-8')
+              g = re.sub(r'compileSdk\s*=\s*[^\n]+', 'compileSdk = 34', g)
+              g = re.sub(r'compileSdkVersion\s+[^\n]+', 'compileSdkVersion 34', g)
+              g = re.sub(r'targetSdk\s*=\s*[^\n]+', 'targetSdk = 34', g)
+              g = re.sub(r'targetSdkVersion\s+[^\n]+', 'targetSdkVersion 34', g)
+              if 'compileSdk' not in g and 'compileSdkVersion' not in g:
+                  g = g.replace('android {', 'android {\n    compileSdk = 34', 1)
+
+              if 'signingConfigs {' not in g:
+                  signing = '''\n    signingConfigs {\n        release {\n            keyAlias keystoreProperties['keyAlias']\n            keyPassword keystoreProperties['keyPassword']\n            storeFile file(keystoreProperties['storeFile'])\n            storePassword keystoreProperties['storePassword']\n        }\n    }\n'''
+                  g = g.replace('    buildTypes {', signing + '\n    buildTypes {', 1)
+
+              g = re.sub(r'signingConfig\s+signingConfigs\.debug', 'signingConfig signingConfigs.release', g)
+              if 'signingConfig signingConfigs.release' not in g:
+                  g = re.sub(
+                      r'release\s*\{',
+                      'release {\n            signingConfig signingConfigs.release',
+                      g,
+                      count=1
+                  )
+
+          app_gradle.write_text(g, encoding='utf-8')
+          print(f'Prepared signed package: {PACKAGE}')
+          print(f'Gradle file: {app_gradle}')
           PY
 
       - name: Get Flutter dependencies
@@ -179,13 +270,13 @@ jobs:
         working-directory: ${{ steps.locate_project.outputs.project_dir }}
         run: flutter analyze || true
 
-      - name: Build release APK
+      - name: Build signed release APK
         working-directory: ${{ steps.locate_project.outputs.project_dir }}
-        run: flutter build apk --release --no-shrink --build-name=1.3.6 --build-number=10
+        run: flutter build apk --release --no-shrink --build-name=1.3.7 --build-number=11
 
-      - name: Build release AAB
+      - name: Build signed release AAB
         working-directory: ${{ steps.locate_project.outputs.project_dir }}
-        run: flutter build appbundle --release --no-shrink --build-name=1.3.6 --build-number=10 || true
+        run: flutter build appbundle --release --no-shrink --build-name=1.3.7 --build-number=11 || true
 
       - name: Collect outputs
         working-directory: ${{ steps.locate_project.outputs.project_dir }}
@@ -194,23 +285,23 @@ jobs:
           set -euo pipefail
           mkdir -p final_outputs
           if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
-            cp build/app/outputs/flutter-apk/app-release.apk final_outputs/abzarino_v1_3_6_release.apk
+            cp build/app/outputs/flutter-apk/app-release.apk final_outputs/abzarino_v1_3_7_signed.apk
           fi
           if [ -f build/app/outputs/bundle/release/app-release.aab ]; then
-            cp build/app/outputs/bundle/release/app-release.aab final_outputs/abzarino_v1_3_6_release.aab
+            cp build/app/outputs/bundle/release/app-release.aab final_outputs/abzarino_v1_3_7_signed.aab
           fi
           ls -lah final_outputs
 
-      - name: Upload APK artifact
+      - name: Upload signed APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: abzarino-v1-3-6-apk
+          name: abzarino-v1-3-7-signed-apk
           path: ${{ steps.locate_project.outputs.project_dir }}/final_outputs/*.apk
           if-no-files-found: error
 
-      - name: Upload AAB artifact
+      - name: Upload signed AAB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: abzarino-v1-3-6-aab
+          name: abzarino-v1-3-7-signed-aab
           path: ${{ steps.locate_project.outputs.project_dir }}/final_outputs/*.aab
           if-no-files-found: ignore
